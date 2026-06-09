@@ -1,13 +1,24 @@
+# =====================================================================
+# PASSO 1: O PATCH DE CONCORRÊNCIA DEVE SER EXECUTADO ANTES DE TUDO
+# =====================================================================
 import sys
-
-# Compatibilidade para servidores assíncronos em ambientes Linux/Production
 if sys.platform != "win32":
     try:
-        from gevent import monkey
-        monkey.patch_all()
+        import eventlet
+        eventlet.monkey_patch()
+        print("Eventlet monkey patch aplicado com sucesso.")
     except ImportError:
-        print("Gevent não instalado!")
+        print("Eventlet não disponível, tentando Gevent...")
+        try:
+            from gevent import monkey
+            monkey.patch_all()
+            print("Gevent monkey patch aplicado com sucesso.")
+        except ImportError:
+            print("Aviso: Nenhum gerenciador assíncrono (Eventlet/Gevent) encontrado!")
 
+# =====================================================================
+# PASSO 2: IMPORTAÇÃO DAS BIBLIOTECAS DE TRABALHO
+# =====================================================================
 from flask import Flask, request, jsonify
 from flask_socketio import SocketIO, emit
 from google import genai
@@ -15,10 +26,10 @@ from google.genai import types
 from dotenv import load_dotenv
 import os
 
-# Carrega as variáveis ocultas do arquivo .env
+# Carrega as variáveis do arquivo .env se estiver em ambiente de teste local
 load_dotenv()
 
-# Define o modelo de IA estável e rápido para chat dinâmico
+# Define o modelo de IA
 MODELO = "gemini-2.5-flash"
 
 # MANUAL DE OPERAÇÕES DO SISTEMA: DETETIVE DE TRUE CRIME (RPG IMERSIVO)
@@ -47,7 +58,7 @@ Se o usuário solicitar um caso real histórico (exemplos: Caso Suzane von Richt
 Se o usuário solicitar um caso fictício, ou disser "Gere um caso aleatório", crie na hora um cenário contendo:
 1. **Consistência Lógica**: Um mistério matematicamente lógico, onde o culpado cometeu um deslize sutil que contradiz seu álibi ou que está ligado a uma pista física.
 2. **Três Suspeitos**: Defina três personagens com motivações plausíveis (financeiras, passionais, profissionais ou vingança) e álibis inicialmente aceitáveis, mas que escondem segredos.
-3. **Três Pistas Físicas**: Distribua as pistas de modo que exijam diferentes ações do usuário (análise laboratorial, reconstituição ou interrogação cruzada).
+3. **Três Pistas Físicas**: Distribua as pistas de modo que exijam diferentes ações do usuário (análise laboratorial, reconstitution ou interrogação cruzada).
 
 ---
 
@@ -75,26 +86,25 @@ Para encerrar a investigação, o usuário deve declarar formalmente quem é o c
 * **Desfecho de Derrota**: Se o usuário insistir em acusações sem fundamento, negligenciar as pistas principais ou acusar inocentes repetidamente, narre de forma trágica as consequências (por exemplo: o suspeito real descobre a investigação e foge, as provas prescrevem, ou o culpado realiza uma nova ação criminosa para encobrir seus rastros).
 """
 
-# Inicializa o cliente do Gemini usando a nova API do Google GenAI
+# Inicializa o cliente do Gemini
 client = genai.Client(api_key=os.getenv("GENAI_KEY"))
 
-# Cria o aplicativo principal Flask
 app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET_KEY", "ch@tb07")
 
-# Configuração de SocketIO com suporte CORS e sem persistência de cookie session do Flask
-socketio = SocketIO(app, cors_allowed_origins="*", manage_session=False)
+# Configurado sem depender de session do Flask para evitar problemas de CORS/Samesite
+# async_mode='threading' para evitar travamento no Windows com Eventlet
+socketio = SocketIO(app, cors_allowed_origins="*", manage_session=False, async_mode='threading')
 
-# Dicionário na memória do servidor para gerenciar as instâncias ativas do chat por ID do socket (request.sid)
+# Dicionário de instâncias em memória, mapeadas pelo ID do Socket
 active_chats = {}
 
 def get_user_chat(sid):
     """
-    Função de gerenciamento de sessões individuais usando o identificador de socket.
-    Dessa forma, cada conexão mantém sua própria instância do chat sem depender de cookies.
+    Recupera ou gera uma sessão do Gemini utilizando o ID de conexão única (request.sid).
     """
     if sid not in active_chats or active_chats[sid] is None:
-        print(f"Instanciando prontuário investigativo para a conexão: {sid}")
+        print(f"Instanciando prontuário de inquérito para o terminal: {sid}")
         try:
             chat_session = client.chats.create(
                 model=MODELO,
@@ -102,7 +112,7 @@ def get_user_chat(sid):
             )
             active_chats[sid] = chat_session
         except Exception as e:
-            app.logger.error(f"Falha ao iniciar o chat Gemini para a conexão {sid}: {e}", exc_info=True)
+            app.logger.error(f"Falha ao iniciar o chat Gemini para o ID {sid}: {e}", exc_info=True)
             raise
     
     return active_chats[sid]
@@ -122,19 +132,12 @@ def root():
 
 @socketio.on('connect')
 def handle_connect():
-    """
-    Disparado assim que a conexão de rede do terminal do usuário é estabelecida.
-    Gera o monólogo de abertura inicial dinamicamente usando a API.
-    """
     sid = request.sid
-    print(f"Terminal conectado: {sid}")
+    print(f"Conexão aceita: {sid}")
     
     try:
-        # Prepara a sessão de chat correspondente para esta conexão única
         user_chat = get_user_chat(sid)
-        print(f"Sessão de trabalho para {sid} inicializada com sucesso.")
         
-        # Envia a diretriz inicial silenciosa para introduzir o caso de forma literária e imersiva
         resposta_inicial = user_chat.send_message(
             "Execute a FASE I das suas instruções de sistema. Escreva um monólogo de abertura atmosférico ambientando a delegacia, descreva a noite e convide o usuário de forma imersiva a escolher entre um caso real histórico conhecido (como Suzane von Richthofen ou Elize Matsunaga) ou um caso fictício gerado na hora. Utilize parágrafos descritivos completos."
         )
@@ -145,36 +148,30 @@ def handle_connect():
             else resposta_inicial.candidates[0].content.parts[0].text
         )
         
-        # Envia as saídas de conexão de segurança e a primeira resposta narrativa da IA
         emit('status_conexao', {'data': 'Conexão autorizada.', 'session_id': sid})
         emit('nova_mensagem', {"remetente": "bot", "texto": texto_inicial, "session_id": sid})
         
     except Exception as e:
-        app.logger.error(f"Erro ao conectar e iniciar histórico do prontuário para {sid}: {e}", exc_info=True)
-        emit('erro', {'erro': 'Não foi possível carregar o banco de dados de crimes do servidor.'})
+        app.logger.error(f"Erro ao conectar ou abrir inquérito para {sid}: {e}", exc_info=True)
+        emit('erro', {'erro': 'Não foi possível ler o banco de dados do servidor.'})
 
 
 @socketio.on('enviar_mensagem')
 def handle_enviar_mensagem(data):
-    """
-    Disparado quando o usuário envia uma nova anotação ou comando ao servidor.
-    """
     sid = request.sid
     try:
         mensagem_usuario = data.get("mensagem")
-        app.logger.info(f"Mensagem recebida do Inspetor {sid}: {mensagem_usuario}")
+        app.logger.info(f"Dados recebidos do terminal {sid}: {mensagem_usuario}")
 
         if not mensagem_usuario:
             emit('erro', {"erro": "A anotação de comando está em branco."})
             return
 
-        # Recupera a sessão ativa do dicionário em memória
         user_chat = get_user_chat(sid)
         if user_chat is None:
-            emit('erro', {"erro": "Arquivo criminal de trabalho inacessível."})
+            emit('erro', {"erro": "Arquivo criminal inacessível no momento."})
             return
 
-        # Envia a ação para processamento cognitivo do Gemini
         resposta_gemini = user_chat.send_message(mensagem_usuario)
 
         resposta_texto = (
@@ -183,25 +180,19 @@ def handle_enviar_mensagem(data):
             else resposta_gemini.candidates[0].content.parts[0].text
         )
         
-        # Retorna a saída para exibição na folha de relatórios do front-end
         emit('nova_mensagem', {"remetente": "bot", "texto": resposta_texto, "session_id": sid})
-        app.logger.info(f"Dados enviados para o terminal {sid}: {resposta_texto}")
 
     except Exception as e:
         app.logger.error(f"Erro ao processar as deduções de {sid}: {e}", exc_info=True)
-        emit('erro', {"erro": f"Ocorreu uma falha ao compilar o relatório: {str(e)}"})
+        emit('erro', {"erro": f"Falha ao gerar o relatório: {str(e)}"})
 
 
 @socketio.on('disconnect')
 def handle_disconnect():
-    """
-    Disparado quando a conexão do usuário é perdida ou encerrada.
-    Limpa a memória do servidor para evitar acúmulo de dados desnecessários.
-    """
     sid = request.sid
     if sid in active_chats:
         del active_chats[sid]
-    print(f"Terminal desconectado e recursos limpos para: {sid}")
+    print(f"Sessão encerrada e liberada da memória: {sid}")
 
 
 if __name__ == "__main__":
