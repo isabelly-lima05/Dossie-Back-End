@@ -8,12 +8,11 @@ if sys.platform != "win32":
     except ImportError:
         print("Gevent não instalado!")
 
-from flask import Flask, request, session, jsonify
+from flask import Flask, request, jsonify
 from flask_socketio import SocketIO, emit
 from google import genai
 from google.genai import types
 from dotenv import load_dotenv
-from uuid import uuid4
 import os
 
 # Carrega as variáveis ocultas do arquivo .env
@@ -83,51 +82,30 @@ client = genai.Client(api_key=os.getenv("GENAI_KEY"))
 app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET_KEY", "ch@tb07")
 
-# Configuração de SocketIO para comunicação em tempo real
-socketio = SocketIO(app, cors_allowed_origins="*")
+# Configuração de SocketIO com suporte CORS e sem persistência de cookie session do Flask
+socketio = SocketIO(app, cors_allowed_origins="*", manage_session=False)
 
-# Memória temporária para manter os históricos das sessões ativos
+# Dicionário na memória do servidor para gerenciar as instâncias ativas do chat por ID do socket (request.sid)
 active_chats = {}
 
-def get_user_chat():
+def get_user_chat(sid):
     """
-    Função de gerenciamento de sessões individuais do usuário.
-    Garante que as investigações de usuários diferentes não se misturem.
+    Função de gerenciamento de sessões individuais usando o identificador de socket.
+    Dessa forma, cada conexão mantém sua própria instância do chat sem depender de cookies.
     """
-    # Passo 1: Cria um identificador exclusivo para novas conexões
-    if 'session_id' not in session:
-        session['session_id'] = str(uuid4())
-        print(f"Nova sessão de investigação iniciada no servidor: {session['session_id']}")
-
-    session_id = session['session_id']
-
-    # Passo 2: Inicializa a sessão com as instruções do manual de True Crime caso não exista
-    if session_id not in active_chats:
-        print(f"Criando novo prontuário investigativo para: {session_id}")
+    if sid not in active_chats or active_chats[sid] is None:
+        print(f"Instanciando prontuário investigativo para a conexão: {sid}")
         try:
             chat_session = client.chats.create(
                 model=MODELO,
                 config=types.GenerateContentConfig(system_instruction=instrucoes)
             )
-            active_chats[session_id] = chat_session
+            active_chats[sid] = chat_session
         except Exception as e:
-            app.logger.error(f"Falha ao iniciar o chat Gemini para {session_id}: {e}", exc_info=True)
+            app.logger.error(f"Falha ao iniciar o chat Gemini para a conexão {sid}: {e}", exc_info=True)
             raise
     
-    # Passo 3: Tratamento de restauração em caso de reinicialização de processos
-    if session_id in active_chats and active_chats[session_id] is None:
-        print(f"Restaurando sessão de chat perdida para: {session_id}")
-        try:
-            chat_session = client.chats.create(
-                model=MODELO,
-                config=types.GenerateContentConfig(system_instruction=instrucoes)
-            )
-            active_chats[session_id] = chat_session
-        except Exception as e:
-            app.logger.error(f"Erro ao recuperar chat Gemini de {session_id}: {e}", exc_info=True)
-            raise
-
-    return active_chats[session_id]
+    return active_chats[sid]
 
 
 @app.route('/')
@@ -148,13 +126,13 @@ def handle_connect():
     Disparado assim que a conexão de rede do terminal do usuário é estabelecida.
     Gera o monólogo de abertura inicial dinamicamente usando a API.
     """
-    print(f"Terminal conectado: {request.sid}")
+    sid = request.sid
+    print(f"Terminal conectado: {sid}")
     
     try:
-        # Prepara a sessão de chat correspondente do usuário
-        user_chat = get_user_chat()
-        user_session_id = session.get('session_id', 'N/A')
-        print(f"Sessão de trabalho para {request.sid} mapeada com id: {user_session_id}")
+        # Prepara a sessão de chat correspondente para esta conexão única
+        user_chat = get_user_chat(sid)
+        print(f"Sessão de trabalho para {sid} inicializada com sucesso.")
         
         # Envia a diretriz inicial silenciosa para introduzir o caso de forma literária e imersiva
         resposta_inicial = user_chat.send_message(
@@ -168,11 +146,11 @@ def handle_connect():
         )
         
         # Envia as saídas de conexão de segurança e a primeira resposta narrativa da IA
-        emit('status_conexao', {'data': 'Conexão autorizada.', 'session_id': user_session_id})
-        emit('nova_mensagem', {"remetente": "bot", "texto": texto_inicial, "session_id": user_session_id})
+        emit('status_conexao', {'data': 'Conexão autorizada.', 'session_id': sid})
+        emit('nova_mensagem', {"remetente": "bot", "texto": texto_inicial, "session_id": sid})
         
     except Exception as e:
-        app.logger.error(f"Erro ao conectar e iniciar histórico do prontuário para {request.sid}: {e}", exc_info=True)
+        app.logger.error(f"Erro ao conectar e iniciar histórico do prontuário para {sid}: {e}", exc_info=True)
         emit('erro', {'erro': 'Não foi possível carregar o banco de dados de crimes do servidor.'})
 
 
@@ -181,16 +159,17 @@ def handle_enviar_mensagem(data):
     """
     Disparado quando o usuário envia uma nova anotação ou comando ao servidor.
     """
+    sid = request.sid
     try:
         mensagem_usuario = data.get("mensagem")
-        app.logger.info(f"Mensagem recebida do Inspetor {session.get('session_id', request.sid)}: {mensagem_usuario}")
+        app.logger.info(f"Mensagem recebida do Inspetor {sid}: {mensagem_usuario}")
 
         if not mensagem_usuario:
             emit('erro', {"erro": "A anotação de comando está em branco."})
             return
 
-        # Recupera a sessão ativa correta
-        user_chat = get_user_chat()
+        # Recupera a sessão ativa do dicionário em memória
+        user_chat = get_user_chat(sid)
         if user_chat is None:
             emit('erro', {"erro": "Arquivo criminal de trabalho inacessível."})
             return
@@ -204,21 +183,25 @@ def handle_enviar_mensagem(data):
             else resposta_gemini.candidates[0].content.parts[0].text
         )
         
-        # Retorna a saída para exibição na folha de relatórios
-        emit('nova_mensagem', {"remetente": "bot", "texto": resposta_texto, "session_id": session.get('session_id')})
-        app.logger.info(f"Dados enviados para o terminal {session.get('session_id', request.sid)}: {resposta_texto}")
+        # Retorna a saída para exibição na folha de relatórios do front-end
+        emit('nova_mensagem', {"remetente": "bot", "texto": resposta_texto, "session_id": sid})
+        app.logger.info(f"Dados enviados para o terminal {sid}: {resposta_texto}")
 
     except Exception as e:
-        app.logger.error(f"Erro ao processar as deduções de {session.get('session_id', request.sid)}: {e}", exc_info=True)
+        app.logger.error(f"Erro ao processar as deduções de {sid}: {e}", exc_info=True)
         emit('erro', {"erro": f"Ocorreu uma falha ao compilar o relatório: {str(e)}"})
 
 
 @socketio.on('disconnect')
 def handle_disconnect():
     """
-    Disparado quando a aba do navegador do usuário é fechada.
+    Disparado quando a conexão do usuário é perdida ou encerrada.
+    Limpa a memória do servidor para evitar acúmulo de dados desnecessários.
     """
-    print(f"Terminal desconectado: {request.sid}, session_id: {session.get('session_id', 'N/A')}")
+    sid = request.sid
+    if sid in active_chats:
+        del active_chats[sid]
+    print(f"Terminal desconectado e recursos limpos para: {sid}")
 
 
 if __name__ == "__main__":
