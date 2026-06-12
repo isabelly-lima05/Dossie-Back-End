@@ -97,10 +97,9 @@ app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET_KEY", "ch@tb07")
 
 # Configuração do Socket.IO para produção:
-# Removemos a definição rígida de async_mode='threading' para permitir que o Socket.IO
-# detecte o Gevent de forma nativa e automática quando hospedado no Render,
-# otimizando o tempo de resposta e a estabilidade.
-socketio = SocketIO(app, cors_allowed_origins="*")
+# Usamos Gevent para deploy em Render, eliminando o aviso de depreciação do Eventlet.
+# O worker do Procfile também usará Gevent com suporte a WebSocket.
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='gevent')
 
 # Dicionário em memória que mapeia o session_id persistente para o objeto de chat do Gemini
 active_chats = {}

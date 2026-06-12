@@ -1,9 +1,8 @@
 flask-cors
-gevent-websocket
 Flask==3.0.3
 Flask-SocketIO==5.3.6
 gevent
-eventlet==0.35.2
+gevent-websocket
 google-genai
 python-dotenv
 gunicorn==22.0.0
