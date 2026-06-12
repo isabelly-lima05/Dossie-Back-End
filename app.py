@@ -1,38 +1,39 @@
-# =====================================================================
-# PASSO 1: O PATCH DE CONCORRÊNCIA DEVE SER EXECUTADO ANTES DE TUDO
-# =====================================================================
 import sys
-if sys.platform != "win32":
-    try:
-        import eventlet
-        eventlet.monkey_patch()
-        print("Eventlet monkey patch aplicado com sucesso.")
-    except ImportError:
-        print("Eventlet não disponível, tentando Gevent...")
-        try:
-            from gevent import monkey
-            monkey.patch_all()
-            print("Gevent monkey patch aplicado com sucesso.")
-        except ImportError:
-            print("Aviso: Nenhum gerenciador assíncrono (Eventlet/Gevent) encontrado!")
 
 # =====================================================================
-# PASSO 2: IMPORTAÇÃO DAS BIBLIOTECAS DE TRABALHO
+# PASSO 1: CONFIGURAÇÃO DE ASSINCRONISMO (GEVENT)
 # =====================================================================
-from flask import Flask, request, jsonify
+# O patch de concorrência deve ser executado antes de qualquer outra importação.
+# Removemos o Eventlet para focar no Gevent, que está listado nos requisitos,
+# garantindo que o servidor lide com múltiplos acessos simultâneos sem travar.
+if sys.platform != "win32":
+    try:
+        from gevent import monkey
+        monkey.patch_all()
+        print("Gevent monkey patch aplicado com sucesso para ambiente Linux/Render.")
+    except ImportError:
+        print("Aviso: Gevent não instalado. Executando em modo síncrono padrão.")
+
+# =====================================================================
+# PASSO 2: IMPORTAÇÃO DE BIBLIOTECAS
+# =====================================================================
+from flask import Flask, request, session, jsonify
 from flask_socketio import SocketIO, emit
 from google import genai
 from google.genai import types
 from dotenv import load_dotenv
+from uuid import uuid4
 import os
 
-# Carrega as variáveis do arquivo .env se estiver em ambiente de teste local
+# Carrega chaves de API e configurações de segurança do arquivo .env
 load_dotenv()
 
-# Define o modelo de IA
-MODELO = "gemini-2.5-flash"
+# =====================================================================
+# PASSO 3: DEFINIÇÕES DO MODELO E MANUAL DE INSTRUÇÕES (PROMPT)
+# =====================================================================
+# Atualizado para a versão recomendada pelo guia de 2026: mais rápida e econômica
+MODELO = "gemini-3.1-flash-lite"
 
-# MANUAL DE OPERAÇÕES DO SISTEMA: DETETIVE DE TRUE CRIME (RPG IMERSIVO)
 instrucoes = """
 Você é um Inspetor Chefe da Divisão de Investigações Especiais, um policial experiente, maduro, perspicaz e meticuloso. Você atua como o parceiro sênior de investigação do usuário. Sua missão é guiar o jogador em uma simulação interativa baseada em arquivos criminais, sejam eles casos reais históricos ou mistérios fictícios gerados sob demanda.
 
@@ -47,18 +48,19 @@ Você é um Inspetor Chefe da Divisão de Investigações Especiais, um policial
 ---
 
 ## 2. GESTÃO DOS ARQUIVOS DE CASOS (REAIS VS. FICTÍCIOS)
-O jogador tem acesso a uma biblioteca virtual infinita de casos (representando mais de 20.000 investigações possíveis):
+O jogador tem acesso a uma biblioteca virtual de investigações:
 
-### DIRETRIZ A - CASOS REAIS HISTÓRICOS
+### DIRETRIZ A - CASOS REAIS HISTÓRICOS (NÃO REVELAR O ASSASSINO)
 Se o usuário solicitar um caso real histórico (exemplos: Caso Suzane von Richthofen, Caso Elize Matsunaga, Caso Isabella Nardoni, Caso Ted Bundy, Caso Jack o Estripador, etc.):
-1. **Fidelidade Histórica**: Reconstitua os fatos, datas, nomes de suspeitos, pistas reais e a solução jurídica exata do caso histórico de forma rigorosa. Não altere o culpado ou os fatos documentados pela história.
-2. **Pacing Investigativo**: Não entregue a solução imediatamente. Apresente o caso na fase inicial de investigação (como se vocês estivessem atuando no dia seguinte ao ocorrido) e permita que o usuário explore os depoimentos e pistas originais da época para chegar à mesma conclusão histórica.
+1. **Fidelidade Histórica sem Revelação Imediata**: Reconstitua rigorosamente os fatos, datas, nomes de suspeitos, pistas reais e a solução jurídica exata registrada pela história. **No entanto, é expressamente proibido revelar quem foi o culpado ou assassino no início ou durante a investigação**.
+2. **Pacing Investigativo**: Apresente o caso no "dia seguinte" ao ocorrido. Descreva o cenário inicial da descoberta do crime e as primeiras pistas disponíveis na época. Permita que o usuário explore os depoimentos de suspeitos históricos, solicite laudos periciais e tente deduzir quem cometeu o crime por conta própria.
+3. **Resolução**: Apenas confirme se o usuário está correto quando ele formalizar a acusação com as respectivas evidências históricas na Fase V.
 
 ### DIRETRIZ B - CASOS FICTÍCIOS DINÂMICOS
 Se o usuário solicitar um caso fictício, ou disser "Gere um caso aleatório", crie na hora um cenário contendo:
 1. **Consistência Lógica**: Um mistério matematicamente lógico, onde o culpado cometeu um deslize sutil que contradiz seu álibi ou que está ligado a uma pista física.
 2. **Três Suspeitos**: Defina três personagens com motivações plausíveis (financeiras, passionais, profissionais ou vingança) e álibis inicialmente aceitáveis, mas que escondem segredos.
-3. **Três Pistas Físicas**: Distribua as pistas de modo que exijam diferentes ações do usuário (análise laboratorial, reconstitution ou interrogação cruzada).
+3. **Três Pistas Físicas**: Distribua as pistas de modo que exijam diferentes ações do usuário (análise laboratorial, reconstituição ou interrogação cruzada).
 
 ---
 
@@ -82,64 +84,84 @@ Se o usuário solicitar interrogar um suspeito específico:
 
 ### FASE V: ACUSAÇÃO E ENCERRAMENTO DO CASO
 Para encerrar a investigação, o usuário deve declarar formalmente quem é o culpado, o motivo do crime e a prova incontestável que o incrimina.
-* **Desfecho de Vitória**: Se a linha lógica estiver correta, narre com suspense e realismo a prisão do criminoso, o interrogatório de confissão final e a elaboração do relatório para o Ministério Público.
+* **Desfecho de Vitória**: Se a linha lógica estiver correta (ou corresponder ao desfecho real histórico), narre com suspense e realismo a prisão do criminoso, o interrogatório de confissão final e a elaboração do relatório para o Ministério Público.
 * **Desfecho de Derrota**: Se o usuário insistir em acusações sem fundamento, negligenciar as pistas principais ou acusar inocentes repetidamente, narre de forma trágica as consequências (por exemplo: o suspeito real descobre a investigação e foge, as provas prescrevem, ou o culpado realiza uma nova ação criminosa para encobrir seus rastros).
 """
 
-# Inicializa o cliente do Gemini
+# Inicializa o cliente do Gemini usando a chave do .env
 client = genai.Client(api_key=os.getenv("GENAI_KEY"))
 
 app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET_KEY", "ch@tb07")
 
-# Configurado sem depender de session do Flask para evitar problemas de CORS/Samesite
-# async_mode='threading' para evitar travamento no Windows com Eventlet
-socketio = SocketIO(app, cors_allowed_origins="*", manage_session=False, async_mode='threading')
+# Configuração do Socket.IO para produção:
+# Removemos a definição rígida de async_mode='threading' para permitir que o Socket.IO
+# detecte o Gevent de forma nativa e automática quando hospedado no Render,
+# otimizando o tempo de resposta e a estabilidade.
+socketio = SocketIO(app, cors_allowed_origins="*")
 
-# Dicionário de instâncias em memória, mapeadas pelo ID do Socket
+# Dicionário em memória que mapeia o session_id persistente para o objeto de chat do Gemini
 active_chats = {}
 
-def get_user_chat(sid):
+def get_user_chat(client_session_id=None):
     """
-    Recupera ou gera uma sessão do Gemini utilizando o ID de conexão única (request.sid).
+    Recupera ou gera uma sessão do Gemini utilizando um identificador de sessão persistente.
+    Para evitar a perda de histórico em quedas de rede, prioriza o session_id
+    enviado pelo cliente ou o armazenado na sessão do Flask.
     """
-    if sid not in active_chats or active_chats[sid] is None:
-        print(f"Instanciando prontuário de inquérito para o terminal: {sid}")
+    # 1. Tenta recuperar o ID enviado diretamente pelo cliente ou pela sessão do Flask
+    session_id = client_session_id
+    if not session_id:
+        if 'session_id' not in session:
+            session['session_id'] = str(uuid4())
+            print(f"Nova session_id gerada no Flask: {session['session_id']}")
+        session_id = session['session_id']
+
+    # 2. Se a ID não possui um chat associado na memória, cria um novo
+    if session_id not in active_chats or active_chats[session_id] is None:
+        print(f"Instanciando novo prontuário de inquérito para o ID de sessão: {session_id}")
         try:
             chat_session = client.chats.create(
                 model=MODELO,
                 config=types.GenerateContentConfig(system_instruction=instrucoes)
             )
-            active_chats[sid] = chat_session
+            active_chats[session_id] = chat_session
         except Exception as e:
-            app.logger.error(f"Falha ao iniciar o chat Gemini para o ID {sid}: {e}", exc_info=True)
+            app.logger.error(f"Falha ao iniciar o chat Gemini para o ID de sessão {session_id}: {e}", exc_info=True)
             raise
     
-    return active_chats[sid]
+    return active_chats[session_id], session_id
 
 
 @app.route('/')
 def root():
     return jsonify({
         "api-websocket": "Detetive de True Crime Dinâmico",
-        "status": "Funcionando"
+        "status": "Funcionando",
+        "version": "1,0"
     })
 
 
-# ------------------------------------------------------------------
+# =====================================================================
 # EVENTOS SOCKET.IO
-# ------------------------------------------------------------------
+# =====================================================================
 
 @socketio.on('connect')
 def handle_connect():
+    """
+    Acionado no momento em que a conexão é estabelecida.
+    Gera a mensagem de abertura imersiva sem revelar detalhes do desfecho dos casos.
+    """
     sid = request.sid
-    print(f"Conexão aceita: {sid}")
+    print(f"Conexão aceita via rádio: {sid}")
     
     try:
-        user_chat = get_user_chat(sid)
+        # Recupera ou inicializa a sessão associada
+        user_chat, session_id = get_user_chat()
         
+        # Envia comando de inicialização solicitando a Fase I
         resposta_inicial = user_chat.send_message(
-            "Execute a FASE I das suas instruções de sistema. Escreva um monólogo de abertura atmosférico ambientando a delegacia, descreva a noite e convide o usuário de forma imersiva a escolher entre um caso real histórico conhecido (como Suzane von Richthofen ou Elize Matsunaga) ou um caso fictício gerado na hora. Utilize parágrafos descritivos completos."
+            "Execute a FASE I das suas instruções de sistema. Escreva uma mensagem curta e imersiva de boas-vindas ambientando o escritório e convide o usuário a digitar ou selecionar se prefere abrir o arquivo de um caso real histórico conhecido ou de um novo caso fictício gerado na hora. Mantenha o mistério sobre qualquer suspeito."
         )
         
         texto_inicial = (
@@ -148,30 +170,39 @@ def handle_connect():
             else resposta_inicial.candidates[0].content.parts[0].text
         )
         
-        emit('status_conexao', {'data': 'Conexão autorizada.', 'session_id': sid})
-        emit('nova_mensagem', {"remetente": "bot", "texto": texto_inicial, "session_id": sid})
+        # Envia a confirmação de conexão e a mensagem inicial para o front-end
+        emit('status_conexao', {'data': 'Conectado com sucesso.', 'session_id': session_id})
+        emit('nova_mensagem', {"remetente": "bot", "texto": texto_inicial, "session_id": session_id})
         
     except Exception as e:
         app.logger.error(f"Erro ao conectar ou abrir inquérito para {sid}: {e}", exc_info=True)
-        emit('erro', {'erro': 'Não foi possível ler o banco de dados do servidor.'})
+        emit('erro', {'erro': 'Não foi possível estabelecer contato com o arquivo central.'})
 
 
 @socketio.on('enviar_mensagem')
 def handle_enviar_mensagem(data):
+    """
+    Processa os comandos e deduções do jogador.
+    Aceita um 'session_id' opcional enviado pelo payload do cliente para maior resiliência.
+    """
     sid = request.sid
     try:
         mensagem_usuario = data.get("mensagem")
+        client_session_id = data.get("session_id") # Opcional enviado pelo front-end para evitar perda de histórico
+        
         app.logger.info(f"Dados recebidos do terminal {sid}: {mensagem_usuario}")
 
         if not mensagem_usuario:
             emit('erro', {"erro": "A anotação de comando está em branco."})
             return
 
-        user_chat = get_user_chat(sid)
+        # Recupera o chat persistente usando o session_id recebido
+        user_chat, session_id = get_user_chat(client_session_id)
         if user_chat is None:
             emit('erro', {"erro": "Arquivo criminal inacessível no momento."})
             return
 
+        # Envia a entrada do usuário para o modelo do Gemini
         resposta_gemini = user_chat.send_message(mensagem_usuario)
 
         resposta_texto = (
@@ -180,7 +211,7 @@ def handle_enviar_mensagem(data):
             else resposta_gemini.candidates[0].content.parts[0].text
         )
         
-        emit('nova_mensagem', {"remetente": "bot", "texto": resposta_texto, "session_id": sid})
+        emit('nova_mensagem', {"remetente": "bot", "texto": resposta_texto, "session_id": session_id})
 
     except Exception as e:
         app.logger.error(f"Erro ao processar as deduções de {sid}: {e}", exc_info=True)
@@ -189,10 +220,14 @@ def handle_enviar_mensagem(data):
 
 @socketio.on('disconnect')
 def handle_disconnect():
+    """
+    Acionado quando a conexão cai ou é fechada pelo usuário.
+    IMPORTANTÍSSIMO: Para evitar que o usuário perca todo o progresso do inquérito policial
+    durante oscilações de rede ou recargas de página, NÃO removemos os dados de 'active_chats' aqui.
+    A sessão permanecerá segura em memória sob o ID da sessão.
+    """
     sid = request.sid
-    if sid in active_chats:
-        del active_chats[sid]
-    print(f"Sessão encerrada e liberada da memória: {sid}")
+    print(f"Sessão de rádio interrompida temporariamente para a conexão: {sid}")
 
 
 if __name__ == "__main__":
