@@ -88,8 +88,10 @@ Para encerrar a investigação, o usuário deve declarar formalmente quem é o c
 * **Desfecho de Derrota**: Se o usuário insistir em acusações sem fundamento, negligenciar as pistas principais ou acusar inocentes repetidamente, narre de forma trágica as consequências (por exemplo: o suspeito real descobre a investigação e foge, as provas prescrevem, ou o culpado realiza uma nova ação criminosa para encobrir seus rastros).
 """
 
-# Inicializa o cliente do Gemini usando a chave do .env
-client = genai.Client(api_key=os.getenv("GENAI_KEY"))
+# Inicializa o cliente do Gemini de forma adiada (lazy init).
+# Em deploys (como Render) é importante não falhar na importação
+# caso a variável de ambiente ainda não esteja definida.
+client = None
 
 app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET_KEY", "ch@tb07")
@@ -116,6 +118,15 @@ def get_user_chat(client_session_id=None):
             session['session_id'] = str(uuid4())
             print(f"Nova session_id gerada no Flask: {session['session_id']}")
         session_id = session['session_id']
+
+    # Garante que o cliente do GenAI esteja inicializado antes de criar chats
+    global client
+    if client is None:
+        genai_key = os.getenv("GENAI_KEY")
+        if not genai_key:
+            app.logger.error("GENAI_KEY não definido no ambiente.")
+            raise RuntimeError("GENAI_KEY não definido no ambiente.")
+        client = genai.Client(api_key=genai_key)
 
     # 2. Se a ID não possui um chat associado na memória, cria um novo
     if session_id not in active_chats or active_chats[session_id] is None:
@@ -231,4 +242,7 @@ def handle_disconnect():
 
 
 if __name__ == "__main__":
-    socketio.run(app)
+    # Em ambientes de deploy (Render), o serviço expõe a porta via `PORT`.
+    host = os.environ.get("HOST", "0.0.0.0")
+    port = int(os.environ.get("PORT", 5000))
+    socketio.run(app, host=host, port=port)
